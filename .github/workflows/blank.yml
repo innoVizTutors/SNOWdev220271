@@ -1,0 +1,208 @@
+name: Pipeline
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+  pull-requests: write
+  deployments: read
+
+on:
+  # https://github.com/actions/labeler/issues/121#issuecomment-1036490254 pull_request vs pull_request_target is permissions when it's a PR from a fork
+  # I have not sufficiently explored this space
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "github.event_name:" ${{ github.event_name }}
+      - run: echo "github.event.pull_request.base.ref:" ${{ github.event.pull_request.base.ref }}
+      - run: echo "github.actor" ${{ github.actor }}
+  quality-check:
+    # skipping pull_requests as they are already covered via 'push'
+    if: github.event_name != 'pull_request'
+    needs: [setup]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.quality-check-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+  package:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      (
+        (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+      ) && (github.actor != 'dependabot[bot]')
+    needs: [setup, quality-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.package-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+  deploy-dev:
+    needs: [setup, package]
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.package.result == 'success' &&
+      inputs.skip-dev != true && (github.actor != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dev_deployment
+      cancel-in-progress: true
+    environment: dev
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.deploy-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+  post-deploy-dev:
+    needs: [setup, deploy-dev]
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-dev.result == 'success' &&
+      inputs.skip-dev != true &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+  acceptance-dev:
+    needs: [setup, deploy-dev]
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-dev.result == 'success' &&
+      inputs.skip-dev != true &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.acceptance-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+  deploy-staging:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      (needs.acceptance-dev.result == 'success' || inputs.skip-dev == true) &&
+      (
+        (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+      ) &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    needs: [setup, package, acceptance-dev]
+    concurrency:
+      group: staging_deployment
+      cancel-in-progress: true
+    environment: staging
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.deploy-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+
+  post-deploy-staging:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-staging.result == 'success' &&
+      github.actor != 'dependabot[bot]'
+    needs: [setup, deploy-staging]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+
+  acceptance-staging:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-staging.result == 'success' &&
+      github.actor != 'dependabot[bot]'
+    needs: [setup, deploy-staging]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.acceptance-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+  deploy-prod:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.acceptance-staging.result == 'success' &&
+      (
+        (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main')
+      ) &&
+      github.actor != 'dependabot[bot]'
+    needs: [setup, package, acceptance-staging]
+    concurrency:
+      group: prod_deployment
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    name: ServiceNow Change Approval
+    environment: prod
+    steps:
+      - name: ServiceNow Change Approval
+        uses: ServiceNow/servicenow-devops-change@v4.0.0
+        id: create
+        with:
+          devops-integration-user-name: ${{ secrets.SN_DEVOPS_USER }}
+          devops-integration-user-password: ${{ secrets.SN_DEVOPS_PASSWORD }}
+          instance-url: ${{ secrets.SN_INSTANCE_URL }}
+          tool-id: ${{ secrets.SN_ORCHESTRATION_TOOL_ID }}
+          context-github: ${{ toJSON(github) }}
+          job-name: 'ServiceNow Change Approval'
+          change-request: '{"setCloseCode":"true","autoCloseChange":true,"attributes":{"short_description":"Devops POC Change","description":"Devops POC Change","implementation_plan":"Software update is tested and results can be found in Test Summaries Tab; When the change is approved the implementation happens automated by the CICD pipeline within the change planned start and end time window.","backout_plan":"When software fails in production, the previous software release will be re-deployed.","test_plan":"Testing if the software was successfully deployed"}}'
+          interval: '100'
+          timeout: '3600'
+          changeCreationTimeOut: '3600'
+          abortOnChangeCreationFailure: true
+          abortOnChangeStepTimeout: true
+      - name: Output of Change Creation
+        run: echo "change-request-number = ${{ steps.create.outputs.change-request-number }}" >> $GITHUB_OUTPUT
+        
+  post-deploy-prod:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-prod.result == 'success' &&
+      github.actor != 'dependabot[bot]'
+    needs: [setup, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+  acceptance-prod:
+    if: |
+      !failure() &&
+      !cancelled() &&
+      needs.deploy-prod.result == 'success' &&
+      github.actor != 'dependabot[bot]'
+    needs: [setup, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.acceptance-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
+
+  summary-metrics:
+    needs: [setup, package, quality-check, acceptance-dev, acceptance-staging, acceptance-prod, deploy-dev, deploy-staging, deploy-prod]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: setup-pfg-certs
+        if: inputs.deploy-runner == 'pfg-hosted'
+        uses: principalfinancialgroup-emu/common-actions-pfg-certs@v1
+
